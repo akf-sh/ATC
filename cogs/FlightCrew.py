@@ -1,11 +1,12 @@
-from disnake.ext import commands
+from disnake.ext import commands,tasks
 import disnake
 from disnake import Embed
 import pymongo
 import os
 import datetime
-from asyncio import sleep, tasks
 import re
+import pytz
+cst = pytz.timezone('US/Central')
 
 
 class FlightCrewConfigurationRulesModal(disnake.ui.Modal):
@@ -68,21 +69,17 @@ class FlightCrewConfigurationRulesModal(disnake.ui.Modal):
             },
             {
                 "$set": {
-                    "flight_crew": {
-                        "configuration": {
-                            "rules": {
+                    "flight_crew.configuration.rules": {
+                                "approved": False,
                                 "short": inter.text_values.get("short"),
                                 "long": inter.text_values.get("long"),
-                            },
-                        }
                     }
                 }
             },
-            upsert=True,
         )
 
         await inter.response.send_message(
-            "Your rules have been updated.", ephemeral=True
+            "Your rules have been updated. Please be patient while a moderator reviews your rules.", ephemeral=True
         )
 
     async def on_error(self, error: Exception, inter: disnake.ModalInteraction):
@@ -107,15 +104,6 @@ class FlightCrewReportUserModal(disnake.ui.Modal):
             title=f"Report Flight",
             custom_id=f"flight_crew_report_modal_{inter.author.id}",
             components=[
-                disnake.ui.TextInput(
-                    label="Who are the User(s) that you are Reporting?",
-                    placeholder="List their Usernames here.",
-                    custom_id="users",
-                    style=disnake.TextInputStyle.paragraph,
-                    min_length=3,
-                    max_length=128,
-                    required=True,
-                ),
                 disnake.ui.TextInput(
                     label="What is the reason you are Reporting them?",
                     placeholder="Be detailed so our Moderators can take action.",
@@ -143,10 +131,7 @@ class FlightCrewReportUserModal(disnake.ui.Modal):
             )
             return
 
-        if (
-            inter.text_values.get("users") is None
-            or inter.text_values.get("reason") is None
-        ):
+        if inter.text_values.get("reason") is None:
             await inter.response.send_message(
                 "You must fill out all fields.", ephemeral=True
             )
@@ -169,7 +154,11 @@ class FlightCrewReportUserModal(disnake.ui.Modal):
                     {
                         "flight": flight["_id"],
                         "reporter": inter.user.id,
-                        "users": [],
+                        "users": [
+                            user
+                            for user in flight["attendants"]
+                            if user != inter.user.id
+                        ],
                         "reason": inter.text_values.get("reason"),
                         "timestamp": datetime.datetime.utcnow(),
                         "status": "Created",
@@ -201,8 +190,14 @@ class FlightCrewReportUserModal(disnake.ui.Modal):
                     value=inter.user.mention,
                 )
                 .add_field(
-                    name="Users",
-                    value=inter.text_values.get("users"),
+                    name="Crew",
+                    value="\n".join(
+                        [
+                            f"<@{user}>"
+                            for user in flight["attendants"]
+                            if user != inter.user.id
+                        ]
+                    ),
                 )
                 .add_field(
                     name="Thread",
@@ -235,8 +230,8 @@ class FlightCrewReportUserModal(disnake.ui.Modal):
                     disnake.ui.ActionRow(
                         disnake.ui.Button(
                             style=disnake.ButtonStyle.green,
-                            label="Respond",
-                            custom_id=f"flight_report_respond_{report_id}",
+                            label="Claim",
+                            custom_id=f"flight_report_claim_{report_id}",
                         ),
                         disnake.ui.Button(
                             style=disnake.ButtonStyle.red,
@@ -286,7 +281,7 @@ class FlightCrewReportModModal(disnake.ui.Modal):
                 disnake.ui.TextInput(
                     label="What actions did you take?",
                     placeholder="Describe the actions taken, include any relevant Case IDs.",
-                    custom_id="long",
+                    custom_id="message",
                     style=disnake.TextInputStyle.paragraph,
                     min_length=20,
                     max_length=2048,
@@ -299,40 +294,95 @@ class FlightCrewReportModModal(disnake.ui.Modal):
         report = self.db.flight_reports.find_one(
             {
                 "moderator": inter.user.id,
+                "status": "Claimed",
+            }
+        )
+        flight = self.db.flights.find_one(
+            {
+                "_id": report["flight"],
             }
         )
 
-        if (
-            inter.text_values.get("short") is None
-            or inter.text_values.get("long") is None
-        ):
+        if inter.text_values.get("message") is None:
             await inter.response.send_message(
                 "You must fill out all fields.", ephemeral=True
             )
             return
-
-        self.db["users"].update_one(
-            {
-                "_id": inter.user.id,
-            },
-            {
-                "$set": {
-                    "flight_crew": {
-                        "configuration": {
-                            "rules": {
-                                "short": inter.text_values.get("short"),
-                                "long": inter.text_values.get("long"),
-                            },
+        else:
+            success = self.db.flight_reports.update_one(
+                {
+                    "_id": report["_id"],
+                },
+                {
+                    "$set": {
+                        "status": "Closed",
+                        "moderator_message": inter.text_values.get("message"),
+                    },
+                    "$push": {
+                        "activity": {
+                            "status": "Closed",
+                            "type": "CLOSE_REPORT",
+                            "context": "Moderator closed the report.",
+                            "timestamp": datetime.datetime.utcnow(),
                         }
-                    }
-                }
-            },
-            upsert=True,
-        )
+                    },
+                },
+            ).acknowledged
+            if success:
+                report_message = await inter.guild.get_channel(
+                    disnake.utils.get(inter.guild.channels, name="flight-reports").id
+                ).fetch_message(report["message_id"])
+                await report_message.edit(
+                    embed=Embed(
+                        title=f"Flight #{flight['_id']} has been Reported",
+                        timestamp=datetime.datetime.utcnow(),
+                    )
+                    .add_field(
+                        name="Reporter",
+                        value=f"<@{report['reporter']}>",
+                    )
+                    .add_field(
+                        name="Crew",
+                        value="\n".join([f"<@{user}>" for user in report["users"]]),
+                    )
+                    .add_field(
+                        name="Thread",
+                        value=disnake.utils.get(
+                            inter.guild.threads, id=flight["message_data"]["thread_id"]
+                        ).mention,
+                    )
+                    .add_field(
+                        name="Reason",
+                        value=report["reason"],
+                        inline=False,
+                    )
+                    .add_field(
+                        name="Status",
+                        value="Closed",
+                    )
+                    .add_field(
+                        name="Moderator",
+                        value=inter.user.mention,
+                    )
+                    .add_field(
+                        name="Moderator Notes",
+                        value="```" + inter.text_values.get("message") + "```",
+                        inline=False,
+                    )
+                    .set_footer(
+                        text=f"Report ID: {report['_id']}",
+                    ),
+                )
 
-        await inter.response.send_message(
-            "Your rules have been updated.", ephemeral=True
-        )
+                await inter.response.send_message(
+                    f"You have successfully responded to Report: `{report['_id']}`",
+                    ephemeral=True,
+                )
+            else:
+                await inter.response.send_message(
+                    "An error occured while responding to the report. Please try again later.",
+                    ephemeral=True,
+                )
 
     async def on_error(self, error: Exception, inter: disnake.ModalInteraction):
         error_embed = disnake.Embed(
@@ -436,13 +486,92 @@ class FlightCrew(commands.Cog):
         }
         self.roles = {
             "multiplayer": os.getenv("DISCORD_FLIGHT_CREW_ROLE", 1127374992141713518),
-            "multiplayer_connect": os.getenv(
-                "DISCORD_MULTIPLAYER_CONNECT_ROLE", 1016925749036449943
-            ),
             "flightcrew_mod": os.getenv(
                 "DISCORD_FLIGHT_CREW_MOD_ROLE", 1128039398760529940
             ),
         }
+        self.flight_manager.start()
+
+    def cog_unload(self):
+        self.flight_manager.cancel()
+
+    @tasks.loop(minutes=1)
+    async def flight_manager(self):
+        await self.bot.wait_until_ready()
+
+        flights_not_started = self.db.flights.find({
+            "status": "Created",
+        })
+
+        flights_started = self.db.flights.find({
+            "status": "Started",
+        })
+
+        for flight in flights_not_started:
+            if flight["created_at"].replace(tzinfo=pytz.UTC) < disnake.utils.utcnow().replace(tzinfo=pytz.UTC) - datetime.timedelta(minutes=15) and len(flight["attendants"]) > 0:
+                print(f"Flight Started #{flight['_id']}")
+                self.db.flights.update_one({
+                    '_id': flight['_id'],
+                }, {
+                    "$set": {
+                        "status": "Started",
+                        "start_time": disnake.utils.utcnow(),
+                    },
+                    "$push": {
+                        "activity": {
+                            "title": "Flight Started",
+                            "type": "FLIGHT_START",
+                            "user": self.bot.user.id,
+                            "context": "Flight has started.",
+                            "timestamp": disnake.utils.utcnow(),
+                        }
+                    }
+                })
+                return await self.flight_message_manager(flight['_id'])
+            
+            if flight["created_at"].replace(tzinfo=pytz.UTC) < disnake.utils.utcnow().replace(tzinfo=pytz.UTC) - datetime.timedelta(minutes=15) and len(flight["attendants"]) == 0:
+                print(f"Flight Canceled #{flight['_id']}")
+                self.db.flights.update_one({
+                    '_id': flight['_id'],
+                }, {
+                    "$set": {
+                        "status": "Canceled",
+                        "completed_at": disnake.utils.utcnow(),
+                    },
+                    "$push": {
+                        "activity": {
+                            "title": "Flight Canceled",
+                            "type": "FLIGHT_CANCEL",
+                            "user": self.bot.user.id,
+                            "context": "Flight has been canceled due to no attendants.",
+                            "timestamp": disnake.utils.utcnow(),
+                        }
+                    }
+                })
+                return await self.flight_message_manager(flight['_id'])
+
+        for flight in flights_started:
+            if flight["created_at"].replace(tzinfo=pytz.UTC) < disnake.utils.utcnow().replace(tzinfo=pytz.UTC) - datetime.timedelta(minutes=30):
+                print(f"Flight Completed #{flight['_id']}")
+                self.db.flights.update_one({
+                    '_id': flight['_id'],
+                }, {
+                    "$set": {
+                        "status": "Completed",
+                        "completed_at": disnake.utils.utcnow(),
+                    },
+                    "$push": {
+                        "activity": {
+                            "title": "Flight Completed",
+                            "type": "FLIGHT_COMPLETE",
+                            "user": self.bot.user.id,
+                            "context": "Flight has been completed.",
+                            "timestamp": disnake.utils.utcnow(),
+                        }
+                    }
+                })
+                return await self.flight_message_manager(flight['_id'])
+
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -476,6 +605,7 @@ class FlightCrew(commands.Cog):
             "flight_crew": {
                 "configuration": {
                     "rules": {
+                        "approved": False,
                         "short": "No rules have been set.",
                         "long": "No rules have been set.",
                     },
@@ -487,12 +617,14 @@ class FlightCrew(commands.Cog):
                 },
             },
         }
-        self.db["users"].insert_one(doc)
+        if self.db["users"].find_one({"_id": int(user_id)}) is None:
+            self.db["users"].insert_one(doc)
         return doc
 
     async def flight_plan_builder(
         self, inter: disnake.ApplicationCommandInteraction, route: list
     ):
+        now = disnake.utils.utcnow()
         document = {
             "_id": self.db.flights.count_documents({}) + 1,
             "host": inter.author.id,
@@ -500,9 +632,8 @@ class FlightCrew(commands.Cog):
             "airports": route,
             "attendants": [],
             "link": inter.filled_options.get("link"),
-            "created_at": disnake.utils.utcnow(),
-            "start_time": disnake.utils.utcnow()
-            + datetime.timedelta(minutes=int(inter.filled_options.get("start_time"))),
+            "created_at": now,
+            "start_time": None,
             "completed_at": None,
             "status": "Created",
             "message_data": {
@@ -561,7 +692,7 @@ class FlightCrew(commands.Cog):
         embed.set_footer(
             text="Interaction ID: " + str(inter.id)
             if type == "error"
-            else "ATC Bot by austin.ts"
+            else "akf.sh"
         )
         if inter.response.is_done():
             await inter.followup.send(embed=embed, ephemeral=True, delete_after=15)
@@ -610,7 +741,6 @@ class FlightCrew(commands.Cog):
         # Footer
         embed.set_footer(
             text=f"Flight Status: {flight_plan['status']}",
-            icon_url=self.bot.user.avatar.url,
         )
 
         """
@@ -631,16 +761,29 @@ class FlightCrew(commands.Cog):
             )
         )
 
+        # Start Flight Button
+
+        thread_view.add_item(
+            disnake.ui.Button(
+                style=disnake.ButtonStyle.green,
+                label="Start Flight",
+                custom_id=f"flight_crew_start_{flight_plan['_id']}",
+                emoji="⏯️",
+                disabled=flight_plan["status"]
+                in ["Started", "Completed", "Canceled", "Moderated"],
+            )
+        )
+
         # Vote Flight Complete Button
 
         thread_view.add_item(
             disnake.ui.Button(
                 style=disnake.ButtonStyle.green,
                 label="Vote Flight Complete",
-                custom_id=f"flight_crew_vote_{flight_plan['_id']}",
+                custom_id=f"flight_crew_complete_{flight_plan['_id']}",
                 emoji="✅",
                 disabled=flight_plan["status"]
-                in ["Completed", "Canceled", "Moderated"],
+                in ["Created", "Completed", "Canceled", "Moderated"],
             )
         )
 
@@ -653,6 +796,7 @@ class FlightCrew(commands.Cog):
                 custom_id=f"flight_crew_report_{flight_plan['_id']}",
                 emoji="⚠",
                 disabled=flight_plan["status"] in ["Moderated"],
+                row=1
             )
         )
 
@@ -698,6 +842,7 @@ class FlightCrew(commands.Cog):
                 emoji="👨‍✈️",
                 custom_id=f"flight_crew_attendants_{flight_plan['_id']}",
                 row=1,
+                disabled=flight_plan["status"] in ["Moderated", "Canceled", "Completed"],
             ),
         )
 
@@ -708,7 +853,7 @@ class FlightCrew(commands.Cog):
             )
             in self.bot.get_guild(self.guild).get_member(flight_plan["host"]).roles
         ):
-            main_view.add_item(
+                main_view.add_item(
                 disnake.ui.Button(
                     style=disnake.ButtonStyle.green,
                     label="Multiplayer Connect",
@@ -723,7 +868,7 @@ class FlightCrew(commands.Cog):
             )
             in self.bot.get_guild(self.guild).get_member(flight_plan["host"]).roles
         ):
-            main_view.add_item(
+                main_view.add_item(
                 disnake.ui.Button(
                     style=disnake.ButtonStyle.green,
                     label="Emergency Control",
@@ -814,6 +959,34 @@ class FlightCrew(commands.Cog):
                             view=built_message["components"]["thread"],
                         )
 
+                elif flight_plan["status"] in ["Completed", "Canceled"]:
+                    built_message = await self.flight_message_builder(
+                        flight_plan, flight_host
+                    )
+                    flight_crew_message: disnake.Message = await self.bot.get_channel(
+                        self.channels.get("flightcrew")
+                    ).fetch_message(flight_plan["message_data"]["message_id"])
+
+                    flight_crew_thread: disnake.Thread = self.bot.get_guild(
+                        self.guild
+                    ).get_thread(flight_plan["message_data"]["thread_id"])
+
+                    flight_crew_thread_message: disnake.Message = (
+                        await flight_crew_thread.fetch_message(
+                            flight_plan["message_data"]["thread_message_id"]
+                        )
+                    )
+
+                    if flight_crew_message:
+                        await flight_crew_message.delete()
+
+                    if flight_crew_thread_message:
+                        await flight_crew_thread_message.edit(
+                            content=None,
+                            embed=built_message["embed"],
+                            view=built_message["components"]["thread"],
+                        )
+
                 else:
                     flight_crew_thread: disnake.Thread = self.bot.get_guild(
                         self.guild
@@ -824,12 +997,8 @@ class FlightCrew(commands.Cog):
                         )
                     )
 
-                    if flight_crew_thread_message:
-                        await flight_crew_thread_message.edit(
-                            content=None,
-                            embed=built_message["embed"],
-                            view=built_message["components"]["thread"],
-                        )
+                    for member in flight_crew_thread.members:
+                        await flight_crew_thread.remove_user(member)
 
                     await flight_crew_thread.edit(archived=True, locked=True)
 
@@ -919,7 +1088,7 @@ class FlightCrew(commands.Cog):
                 "attendants": {"$in": [member.id]},
             }
         )
-        if flight is not None:
+        if flight is not None and flight['status'] == "Created":
             self.db["flight_crew"].update_one(
                 {"_id": flight["_id"]},
                 {
@@ -939,7 +1108,7 @@ class FlightCrew(commands.Cog):
     @commands.Cog.listener()
     async def on_thread_member_join(self, member: disnake.ThreadMember):
         flight = self.db.flights.find_one({"message_data.thread_id": member.thread.id})
-        if flight is not None:
+        if flight is not None and flight['status'] == "Created":
             user: disnake.User = disnake.utils.get(
                 member.thread.guild.members, id=member.id
             )
@@ -1181,7 +1350,7 @@ class FlightCrew(commands.Cog):
                     title="Not Allowed",
                     message="Flight does not exist.",
                 )
-            elif inter.author.id not in plan["attendants"]:
+            elif inter.author.id not in plan["attendants"] and inter.author.id != plan['host']:
                 return await self.reply_builder(
                     inter,
                     title="Not Allowed",
@@ -1297,6 +1466,90 @@ class FlightCrew(commands.Cog):
                 message="This host has the Emergency Control Gamepass, meaning the host can cause an emergency during the flight.",
             )
 
+        if inter.data.custom_id.startswith("flight_report_claim_"):
+            report = self.db["flight_reports"].find_one(
+                {"_id": int(inter.data.custom_id.split("_")[-1])}
+            )
+            flight = self.db["flights"].find_one({"_id": report["flight"]})
+            if (
+                disnake.utils.get(inter.guild.roles, name="Moderation Team")
+                not in inter.author.roles
+                and disnake.utils.get(inter.guild.roles, name="Administration Team")
+                not in inter.author.roles
+                and disnake.utils.get(inter.guild.roles, name="Leadership")
+                not in inter.author.roles
+            ):
+                return await self.reply_builder(
+                    inter,
+                    title="Not Allowed",
+                    message="You are not allowed to claim this report.",
+                )
+            if report["moderator"] is not None:
+                return await self.reply_builder(
+                    inter,
+                    title="Not Allowed",
+                    message="This report has already been claimed.",
+                )
+            embed = (
+                Embed(
+                    title=f"Flight #{flight['_id']} has been Reported",
+                    timestamp=datetime.datetime.utcnow(),
+                )
+                .add_field(
+                    name="Reporter",
+                    value=f"<@{report['reporter']}>",
+                )
+                .add_field(
+                    name="Users",
+                    value="\n".join([f"<@{user}>" for user in flight["attendants"]]),
+                )
+                .add_field(
+                    name="Thread",
+                    value=disnake.utils.get(
+                        inter.guild.threads, id=flight["message_data"]["thread_id"]
+                    ).mention,
+                )
+                .add_field(
+                    name="Reason",
+                    value=report["reason"],
+                    inline=False,
+                )
+                .add_field(
+                    name="Status",
+                    value="Claimed",
+                )
+                .add_field(
+                    name="Moderator",
+                    value=inter.user.mention,
+                )
+                .add_field(
+                    name="Moderator Notes",
+                    value="None",
+                    inline=False,
+                )
+                .set_footer(
+                    text=f"Report ID: {report['_id']}",
+                )
+            )
+            await self.db["flight_reports"].update_one(
+                {"_id": report["_id"]},
+                {
+                    "$set": {"moderator": inter.user.id, "status": "Claimed"},
+                    "$push": {
+                        "activity": {
+                            "type": "CLAIMED",
+                            "user": inter.user.id,
+                            "context": "Has claimed the report as a Moderator",
+                            "timestamp": disnake.utils.utcnow(),
+                        }
+                    },
+                },
+            )
+            message: disnake.Message = inter.guild.get_channel(
+                disnake.utils.get(inter.guild.channels, name="flight-reports")
+            ).fetch_message(report["message_id"])
+            await message.edit(embed=embed)
+
         if inter.data.custom_id.startswith("flight_report_respond_"):
             pass
 
@@ -1317,7 +1570,8 @@ class FlightCrew(commands.Cog):
                 return await self.reply_builder(
                     inter,
                     title=f"Flight #{flight['_id']} Crew",
-                    message="\n".join(
+                    message=f"Host: <@{flight['host']}>\n\n"
+                    + "\n".join(
                         [
                             self.bot.get_user(user).mention
                             for user in flight["attendants"]
@@ -1326,6 +1580,64 @@ class FlightCrew(commands.Cog):
                     if len(flight["attendants"]) > 0
                     else "No one has joined this host's flight.",
                 )
+
+        if inter.data.custom_id.startswith("flight_crew_start_"):
+            flight = self.db["flights"].find_one(
+                {"_id": int(inter.data.custom_id.split("_")[-1])}
+            )
+
+            if flight is None:
+                return await self.reply_builder(
+                    inter,
+                    title="Flight Not Found",
+                    message=f'Flight #{inter.data.custom_id.split("_")[-1]} does not exist.',
+                )
+            else:
+                if flight['status'] == 'Created':
+                    if flight['host'] == inter.author.id:
+                        if len(flight['attendants']) == 0:
+                            return await self.reply_builder(
+                    inter,
+                    title="Not Allowed",
+                    message=f'You cannot start a flight with no crew.',
+                )
+                        self.db['flights'].update_one(
+                                {'_id': flight['_id']},
+                                {'$push': {
+                                    'activity': {
+                                        'title': 'Flight Started',
+                                        'type': 'START_FLIGHT',
+                                        'user': inter.author.id,
+                                        'context': 'Flight has been started by the host.',
+                                        'timestamp': disnake.utils.utcnow()
+                                    }
+                                },
+                                '$set': {
+                                    'status': 'Started',
+                                    'start_time': disnake.utils.utcnow()
+                                }
+                                }
+                            )
+                        await self.flight_message_manager(flight['_id'])
+
+                        return await self.reply_builder(
+                                inter,
+                                title="Flight Started",
+                                message=f"Flight #{flight['_id']} has been marked as started.",
+                            )
+                    else:
+                        return await self.reply_builder(
+                            inter,
+                            title="Not Allowed",
+                            message="You are not allowed to start this flight.",
+                        )
+                    
+                else:
+                    return await self.reply_builder(
+                        inter,
+                        title="Not Allowed",
+                        message="This flight cannot be marked as started.",
+                    )
 
     @commands.slash_command(
         name="link_validator",
@@ -1388,8 +1700,11 @@ class FlightCrew(commands.Cog):
             )
 
     @commands.slash_command(name="flight", description="Flight Crew Command Group")
-    @commands.has_role(1012560028475084870)
+    @commands.has_role("Testers")
     async def flight(self, inter):
+        await self.create_user(
+            inter.author.id
+        )
         self.db.logs.insert_one(
             {
                 "_id": inter.id,
@@ -1424,21 +1739,8 @@ class FlightCrew(commands.Cog):
                 required=True,
             ),
             disnake.Option(
-                name="start_time",
-                description="The time the flight will Start",
-                choices=commands.option_enum(
-                    {
-                        "In 5 Minutes": "5",
-                        "In 10 Minutes": "10",
-                        "In 15 Minutes": "15",
-                        "In 20  Minutes": "20",
-                    }
-                ),
-                required=True,
-            ),
-            disnake.Option(
                 name="link",
-                description="The link to the flight plan",
+                description="The link to your Profile/Private Server/Experience Invite",
                 required=True,
             ),
             disnake.Option(
@@ -1459,7 +1761,6 @@ class FlightCrew(commands.Cog):
         self,
         inter: disnake.ApplicationCommandInteraction,
         aircraft: str,
-        start_time: str,
         link: str,
         departure_airport: str,
         arrival_airport: str,
@@ -1511,6 +1812,7 @@ class FlightCrew(commands.Cog):
                 type="error",
             )
 
+
     @flight_create.sub_command(
         name="multileg",
         description="Create an advanced Flight Plan, that consists of multiple legs (Maximum 5)",
@@ -1524,21 +1826,8 @@ class FlightCrew(commands.Cog):
                 required=True,
             ),
             disnake.Option(
-                name="start_time",
-                description="The time the flight will Start",
-                choices=commands.option_enum(
-                    {
-                        "In 5 Minutes": "5",
-                        "In 10 Minutes": "10",
-                        "In 15 Minutes": "15",
-                        "In 20  Minutes": "20",
-                    }
-                ),
-                required=True,
-            ),
-            disnake.Option(
                 name="link",
-                description="The link to the flight plan",
+                description="The link to your Profile/Private Server/Experience Invite",
                 required=True,
             ),
             disnake.Option(
@@ -1577,7 +1866,6 @@ class FlightCrew(commands.Cog):
         self,
         inter: disnake.ApplicationCommandInteraction,
         aircraft: str,
-        start_time: str,
         link: str,
         origin: str,
         leg_1: str,
@@ -1679,13 +1967,6 @@ class FlightCrew(commands.Cog):
         pass
 
     @flight_config.sub_command(
-        name="minimum_role",
-        description="Set the minimum flight role required to join your Flight Crew posts.",
-    )
-    async def flight_config_minimum_role(self, inter, role: disnake.Role):
-        pass
-
-    @flight_config.sub_command(
         name="block",
         description="Block a user from joining your Flight Crew posts.",
     )
@@ -1699,13 +1980,13 @@ class FlightCrew(commands.Cog):
             )
 
         author = self.db["users"].find_one({"_id": inter.author.id})
-        if author["blocklist"] and str(user.id) in author["blocklist"]:
+        if author['flight_crew']['configuration']["blocklist"] and str(user.id) in author['flight_crew']['configuration']["blocklist"]:
             return await inter.response.send_message(
                 content="This user is already blocked!", ephemeral=True
             )
         else:
             self.db["users"].update_one(
-                {"_id": inter.author.id}, {"$push": {"blocklist": str(user.id)}}
+                {"_id": inter.author.id}, {"$push": {"flight_crew.configuration.blocklist": str(user.id)}}
             )
             return await inter.response.send_message(
                 content=f"Blocked {user.mention} from joining your Flight Crew posts!",
@@ -1725,7 +2006,7 @@ class FlightCrew(commands.Cog):
                 content="You cannot unblock yourself!", ephemeral=True
             )
         author = self.db["users"].find_one({"_id": inter.author.id})
-        if author["blocklist"] and str(user.id) not in author["blocklist"]:
+        if author['flight_crew']['configuration']["blocklist"] and str(user.id) not in author['flight_crew']['configuration']["blocklist"]:
             return await inter.response.send_message(
                 content="This user is not blocked!", ephemeral=True
             )
@@ -1766,6 +2047,9 @@ class FlightCrew(commands.Cog):
         name="rules", description="Set the rules for your Flight Crew posts."
     )
     @commands.cooldown(1, 300, commands.BucketType.user)
+    @commands.has_guild_permissions(
+        administrator=True
+    )
     async def flight_config_rules(self, inter: disnake.ApplicationCommandInteraction):
         await inter.response.send_modal(modal=FlightCrewConfigurationRulesModal(inter))
 

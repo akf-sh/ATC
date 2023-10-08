@@ -11,7 +11,7 @@ activity = disnake.Activity(
     type=disnake.ActivityType.playing,
 )
 bot = commands.InteractionBot(
-    test_guilds=[942889868428730369, 586521898083418132],
+    test_guilds=[942889868428730369, 1039965646378766347],
     command_sync_flags=command_sync_flags,
     intents=disnake.Intents.all(),
     activity=activity,
